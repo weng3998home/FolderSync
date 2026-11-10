@@ -5,6 +5,8 @@ Folder Sync - 目录同步工具
 """
 
 import errno
+import ctypes
+import re
 import sys
 import os
 import shlex
@@ -13,12 +15,14 @@ import subprocess
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlparse
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QMessageBox
+    QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QTableWidgetItem, QVBoxLayout
 )
-from PyQt6.QtCore import QCoreApplication, QThread, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, QThread, Qt, pyqtSignal
 
 # 导入 Qt Designer 生成的 UI 类
 from ui_main_window import Ui_MainWindow
+import windows_service
 
 
 def _is_ubuntu():
@@ -214,6 +218,33 @@ def _build_sync_command(dir_a: str, dir_b: str) -> str:
         return subprocess.list2cmdline(arguments)
 
     return f"./folder_sync {shlex.quote(dir_a)} {shlex.quote(dir_b)}"
+
+
+def _run_sync_once(
+    dir_a: str, dir_b: str, log_callback
+) -> str:
+    """Run one existing synchronization round without starting a Qt event loop."""
+    local_a, local_b = _resolve_sync_paths(dir_a, dir_b)
+    worker = SyncWorker(local_a, local_b)
+    worker.log.connect(log_callback)
+    result = []
+    worker.finished_signal.connect(result.append)
+    worker.run()
+    if not result:
+        raise RuntimeError("同步轮次未返回结果。")
+    return result[0]
+
+
+def _is_mapped_drive(path: str) -> bool:
+    if os.name != "nt":
+        return False
+    normalized_path = path.replace("/", "\\")
+    match = re.match(r"^([A-Za-z]:)\\", normalized_path)
+    if not match:
+        return False
+    return ctypes.windll.kernel32.GetDriveTypeW(
+        match.group(1) + "\\"
+    ) == 4
 
 
 # ──────────────────────────────────────────────
@@ -470,32 +501,77 @@ class SyncWorker(QThread):
 # 主窗口
 # ──────────────────────────────────────────────
 
+class _PasswordDialog(QDialog):
+    def __init__(self, account: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("确认服务账户")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"请输入 Windows 账户 {account} 的密码。\n"
+            "密码仅用于向 SCM 配置服务账户，不会保存到文件或日志。"
+        ))
+        self.password_edit = QLineEdit(self)
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("Windows 账户密码")
+        layout.addWidget(self.password_edit)
+        buttons = QHBoxLayout()
+        self.cancel_button = QPushButton("取消", self)
+        self.create_button = QPushButton("创建并启动", self)
+        self.cancel_button.clicked.connect(self.reject)
+        self.create_button.clicked.connect(self.accept)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.create_button)
+        layout.addLayout(buttons)
+
+
 class MainWindow(QMainWindow, Ui_MainWindow):
     def __init__(self):
         super().__init__()
         self.setupUi(self)
         self.worker = None
         self._sync_command_args = None
+        self._successful_sync_dirs = None
 
         # 连接信号
         self.btn_browse_a.clicked.connect(self._browse_dir_a)
         self.btn_browse_b.clicked.connect(self._browse_dir_b)
         self.btn_sync.clicked.connect(self._start_sync)
         self.btn_copy_command.clicked.connect(self._copy_command)
+        self.btn_create_service.clicked.connect(self._create_service)
+        self.btn_refresh_services.clicked.connect(self._refresh_services)
+        self.btn_delete_service.clicked.connect(self._delete_selected_service)
+        self.service_table.itemSelectionChanged.connect(
+            self._update_delete_button
+        )
+        self.btn_create_service.setEnabled(False)
+        self.btn_delete_service.setEnabled(False)
+        self.service_group.setVisible(os.name == "nt")
 
         self.statusbar.showMessage("就绪 — 请选择两个目录")
+        if os.name == "nt":
+            self._refresh_services()
 
     def _browse_dir_a(self):
         dir_path = pick_folder("选择目录 A", self.edit_dir_a.text())
         if dir_path:
             self.edit_dir_a.setText(dir_path)
+            self._update_service_eligibility()
             self.statusbar.showMessage(f"目录 A: {dir_path}")
 
     def _browse_dir_b(self):
         dir_path = pick_folder("选择目录 B", self.edit_dir_b.text())
         if dir_path:
             self.edit_dir_b.setText(dir_path)
+            self._update_service_eligibility()
             self.statusbar.showMessage(f"目录 B: {dir_path}")
+
+    def _update_service_eligibility(self):
+        self.btn_create_service.setEnabled(
+            os.name == "nt"
+            and self._successful_sync_dirs is not None
+            and (self.edit_dir_a.text(), self.edit_dir_b.text())
+            == self._successful_sync_dirs
+        )
 
     def _start_sync(self):
         display_a = self.edit_dir_a.text()
@@ -521,6 +597,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             return
 
         # 清空日志，禁用按钮
+        self._successful_sync_dirs = None
+        self.btn_create_service.setEnabled(False)
         self.log_output.clear()
         self.edit_command.clear()
         self._sync_command_args = (display_a, display_b)
@@ -550,14 +628,189 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.statusbar.showMessage(summary)
         if summary.startswith("出错:"):
             self._sync_command_args = None
+            self._successful_sync_dirs = None
+            self.btn_create_service.setEnabled(False)
             QMessageBox.critical(self, "同步失败", summary)
         else:
             if self._sync_command_args is not None:
                 dir_a, dir_b = self._sync_command_args
                 self.edit_command.setText(_build_sync_command(dir_a, dir_b))
+                self._successful_sync_dirs = (dir_a, dir_b)
+                self._update_service_eligibility()
             self._sync_command_args = None
             self.progress_bar.setValue(100)
             QMessageBox.information(self, "同步完成", summary)
+
+    def _create_service(self):
+        selected_dirs = (self.edit_dir_a.text(), self.edit_dir_b.text())
+        if (
+            self._successful_sync_dirs is None
+            or selected_dirs != self._successful_sync_dirs
+        ):
+            self.btn_create_service.setEnabled(False)
+            QMessageBox.warning(
+                self, "尚未成功同步",
+                "请先在当前窗口中成功完成这两个目录的交互式同步。"
+            )
+            return
+
+        try:
+            windows_service.require_admin()
+            interval = windows_service.validate_interval(
+                self.spin_service_interval.value()
+            )
+            local_a, local_b = _resolve_sync_paths(*selected_dirs)
+            account = windows_service.current_account_name()
+            service_name = windows_service.next_service_name(local_a)
+        except (ValueError, windows_service.ServiceManagerError) as exc:
+            QMessageBox.critical(self, "无法创建服务", str(exc))
+            return
+
+        mapped = [
+            path for path in (local_a, local_b) if _is_mapped_drive(path)
+        ]
+        network_note = (
+            "\n\n检测到映射网络驱动器：服务通常无法访问登录会话映射的盘符。"
+            "请改用 UNC 路径（例如 \\\\server\\share\\folder），并确保该账户"
+            "具有共享权限和 NTFS 权限。"
+            if mapped else
+            "\n\n若使用网络目录，建议配置 UNC 路径（\\\\server\\share\\folder）；"
+            "服务不会继承登录会话中的映射盘符。请确保该账户具有共享权限和 NTFS 权限。"
+        )
+        details = (
+            "即将在 Windows 服务控制管理器中安装并立即启动服务：\n\n"
+            f"服务名称：{service_name}\n"
+            f"服务目录 A（解析后）：{local_a}\n"
+            f"服务目录 B（解析后）：{local_b}\n"
+            f"同步间隔：{interval} 分钟（服务启动后立即同步；每轮完成后等待该间隔）\n"
+            f"运行账户：{account}\n\n"
+            "服务将设置为开机自动启动。"
+            f"{network_note}"
+        )
+        if QMessageBox.question(
+            self, "确认创建 Windows 服务", details,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        password_dialog = _PasswordDialog(account, self)
+        if password_dialog.exec() != QDialog.DialogCode.Accepted:
+            password_dialog.password_edit.clear()
+            password_dialog.deleteLater()
+            return
+
+        password = password_dialog.password_edit.text()
+        password_dialog.password_edit.clear()
+        try:
+            windows_service.create_service(
+                local_a,
+                local_b,
+                local_a,
+                local_b,
+                interval,
+                account,
+                password,
+                service_name,
+            )
+        except windows_service.ServiceStartError as exc:
+            remove = QMessageBox.question(
+                self, "服务已安装但启动失败",
+                f"{exc}\n\n是否现在删除已安装的服务？选择“否”会保留服务，"
+                "可在服务列表中检查状态后再处理。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if remove == QMessageBox.StandardButton.Yes:
+                try:
+                    windows_service.delete_service(exc.service_name)
+                    QMessageBox.information(
+                        self, "服务已删除",
+                        "停止并删除操作已提交。SCM 可能会延迟完成删除。"
+                    )
+                except windows_service.ServiceManagerError as delete_error:
+                    QMessageBox.critical(
+                        self, "删除失败", str(delete_error)
+                    )
+            else:
+                QMessageBox.warning(self, "服务未启动", str(exc))
+        except windows_service.ServiceManagerError as exc:
+            QMessageBox.critical(self, "服务创建失败", str(exc))
+        else:
+            QMessageBox.information(
+                self, "服务已创建",
+                f"服务“{service_name}”已安装并启动，且已设置为开机自动启动。"
+            )
+        finally:
+            password = ""
+            password_dialog.password_edit.clear()
+            password_dialog.deleteLater()
+            self._refresh_services()
+
+    def _refresh_services(self):
+        if os.name != "nt":
+            return
+        self.service_table.setRowCount(0)
+        try:
+            services = windows_service.list_managed_services()
+        except windows_service.ServiceManagerError as exc:
+            self.statusbar.showMessage(f"读取服务列表失败：{exc}")
+            QMessageBox.critical(self, "服务列表读取失败", str(exc))
+            return
+
+        for service in services:
+            row = self.service_table.rowCount()
+            self.service_table.insertRow(row)
+            values = (
+                service.name,
+                service.directory_a,
+                service.directory_b,
+                f"{service.interval_minutes} 分钟",
+                service.status,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, service.name)
+                self.service_table.setItem(row, column, item)
+        self._update_delete_button()
+        self.statusbar.showMessage(f"已刷新服务列表（{len(services)} 个 FolderSync 服务）")
+
+    def _update_delete_button(self):
+        self.btn_delete_service.setEnabled(
+            os.name == "nt" and self.service_table.currentRow() >= 0
+        )
+
+    def _delete_selected_service(self):
+        row = self.service_table.currentRow()
+        if row < 0:
+            return
+        service_name = self.service_table.item(row, 0).data(
+            Qt.ItemDataRole.UserRole
+        )
+        directory_a = self.service_table.item(row, 1).text()
+        directory_b = self.service_table.item(row, 2).text()
+        if QMessageBox.question(
+            self, "确认删除服务",
+            f"将停止（如正在运行）并从 SCM 删除以下服务：\n\n"
+            f"服务名称：{service_name}\n目录 A：{directory_a}\n目录 B：{directory_b}\n\n"
+            "这会删除服务注册，不只是停止服务。SCM 可能会延迟完成删除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            windows_service.require_admin()
+            windows_service.delete_service(service_name)
+        except windows_service.ServiceManagerError as exc:
+            QMessageBox.critical(self, "删除服务失败", str(exc))
+        else:
+            QMessageBox.information(
+                self, "删除请求已提交",
+                f"服务“{service_name}”已提交停止并删除。"
+                "SCM 可能因待删除机制而延后完成。"
+            )
+        self._refresh_services()
 
     def _copy_command(self):
         command = self.edit_command.text()
@@ -602,6 +855,8 @@ def run_command_line(dir_a: str, dir_b: str) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--run-service":
+        sys.exit(windows_service.run_service(sys.argv[2], _run_sync_once))
     if len(sys.argv) == 3:
         sys.exit(run_command_line(sys.argv[1], sys.argv[2]))
     if len(sys.argv) != 1:

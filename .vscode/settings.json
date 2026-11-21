@@ -1,0 +1,11 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+    "pyqt-integration.pyuic.path": "${workspaceFolder}/.venv/bin/pyuic6",
+    "pyqt-integration.pyuic.compileOptions": "",
+    "pyqt-integration.pyrcc.path": "${workspaceFolder}/.venv/bin/pyrcc6",
+    "pyqt-integration.pylupdate.path": "${workspaceFolder}/.venv/bin/pylupdate6",
+
+    "pyqt-integration.qtdesigner.path": "/usr/lib/qt6/bin/designer",
+    "pyqt-integration.linguist.path": "/usr/lib/qt6/bin/linguist"
+}

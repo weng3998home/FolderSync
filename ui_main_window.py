@@ -1,4 +1,4 @@
-# Form implementation generated from reading ui file 'main_window.ui'
+# Form implementation generated from reading ui file '.\folder_sync\main_window.ui'
 #
 # Created by: PyQt6 UI code generator 6.11.0
 #
@@ -12,7 +12,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 class Ui_MainWindow(object):
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(900, 900)
+        MainWindow.resize(900, 1000)
         self.centralwidget = QtWidgets.QWidget(parent=MainWindow)
         self.centralwidget.setObjectName("centralwidget")
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
@@ -69,6 +69,10 @@ class Ui_MainWindow(object):
         self.btn_create_service = QtWidgets.QPushButton(parent=self.service_group)
         self.btn_create_service.setObjectName("btn_create_service")
         self.service_controls_layout.addWidget(self.btn_create_service)
+        self.btn_start_service = QtWidgets.QPushButton(parent=self.service_group)
+        self.btn_start_service.setEnabled(False)
+        self.btn_start_service.setObjectName("btn_start_service")
+        self.service_controls_layout.addWidget(self.btn_start_service)
         spacerItem = QtWidgets.QSpacerItem(40, 20, QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
         self.service_controls_layout.addItem(spacerItem)
         self.btn_refresh_services = QtWidgets.QPushButton(parent=self.service_group)
@@ -97,6 +101,20 @@ class Ui_MainWindow(object):
         item = QtWidgets.QTableWidgetItem()
         self.service_table.setHorizontalHeaderItem(4, item)
         self.service_layout.addWidget(self.service_table)
+        self.label_service_command = QtWidgets.QLabel(parent=self.service_group)
+        self.label_service_command.setObjectName("label_service_command")
+        self.service_layout.addWidget(self.label_service_command)
+        self.service_command_layout = QtWidgets.QHBoxLayout()
+        self.service_command_layout.setObjectName("service_command_layout")
+        self.service_command_output = QtWidgets.QPlainTextEdit(parent=self.service_group)
+        self.service_command_output.setMaximumSize(QtCore.QSize(16777215, 110))
+        self.service_command_output.setReadOnly(True)
+        self.service_command_output.setObjectName("service_command_output")
+        self.service_command_layout.addWidget(self.service_command_output)
+        self.btn_copy_service_command = QtWidgets.QPushButton(parent=self.service_group)
+        self.btn_copy_service_command.setObjectName("btn_copy_service_command")
+        self.service_command_layout.addWidget(self.btn_copy_service_command)
+        self.service_layout.addLayout(self.service_command_layout)
         self.label_service_note = QtWidgets.QLabel(parent=self.service_group)
         self.label_service_note.setWordWrap(True)
         self.label_service_note.setObjectName("label_service_note")
@@ -152,6 +170,7 @@ class Ui_MainWindow(object):
         self.service_group.setTitle(_translate("MainWindow", "Windows 定时同步服务"))
         self.label_service_interval.setText(_translate("MainWindow", "同步间隔（分钟）："))
         self.btn_create_service.setText(_translate("MainWindow", "创建并启动服务..."))
+        self.btn_start_service.setText(_translate("MainWindow", "更新密码并启动"))
         self.btn_refresh_services.setText(_translate("MainWindow", "刷新服务列表"))
         self.btn_delete_service.setText(_translate("MainWindow", "删除服务"))
         item = self.service_table.horizontalHeaderItem(0)
@@ -164,6 +183,9 @@ class Ui_MainWindow(object):
         item.setText(_translate("MainWindow", "同步间隔"))
         item = self.service_table.horizontalHeaderItem(4)
         item.setText(_translate("MainWindow", "运行状态"))
+        self.label_service_command.setText(_translate("MainWindow", "服务入口与排错命令（选中服务后显示）："))
+        self.service_command_output.setPlaceholderText(_translate("MainWindow", "选择服务后显示服务进程入口、启动/检查命令和日志位置..."))
+        self.btn_copy_service_command.setText(_translate("MainWindow", "复制启动命令"))
         self.label_service_note.setText(_translate("MainWindow", "创建服务前须在本窗口成功完成一次同步。服务使用当前 Windows 账户；网络目录请使用 UNC 路径，映射盘符不会随登录会话传递给服务。"))
         self.label_log.setText(_translate("MainWindow", "日志输出："))
         self.label_command.setText(_translate("MainWindow", "执行命令（可复制后在终端直接运行）："))

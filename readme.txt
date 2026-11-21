@@ -30,6 +30,10 @@ FolderSync — 跨平台文件夹同步工具
 
 - 智能同步逻辑：按文件修改时间比较，较新文件覆盖较旧文件
 
+- 忽略 Windows 系统/临时内容：Thumbs.db、ehthumbs.db、Desktop.ini、
+  *.tmp、*.temp、~*.tmp、*.lnk、pagefile.sys、hiberfil.sys、swapfile.sys，
+  以及 $Recycle.Bin 和 System Volume Information 目录（及其中全部内容）
+
 - DEL_ 前缀删除指令：以 DEL_ 开头的文件/目录会触发跨目录定向删除
 
 - 时间差防回拷：内置时间容差机制，避免刚同步的文件因时间戳偏差被反向拷贝
@@ -47,20 +51,16 @@ FolderSync — 跨平台文件夹同步工具
 技术栈
 ================================================================================
 
-Python          3.8+
-PyQt6           6.11.0
-PyQt6-Qt6      6.11.2
-PyQt6_sip      13.13.0
-PyInstaller     最新版
+Python          3.10+
+PyQt6           6.12.0
+PyInstaller     6.22.3
 
 安装依赖：
     pip install -r requirements.txt
 
 requirements.txt 内容：
-    PyQt6==6.11.0
-    PyQt6-Qt6==6.11.2
-    PyQt6_sip==13.13.0
-    pywin32>=306; sys_platform == "win32"
+    PyQt6==6.12.0
+    pywin32==312; sys_platform == "win32"
 
 
 ================================================================================
@@ -74,17 +74,21 @@ Windows -> FolderSync.exe：
 
 输出：dist\FolderSync.exe
 
-Windows 服务所需的 pywin32 模块由 `FolderSync.spec` 显式打包；请使用该配置构建
-Windows 版本，不要改用不包含服务依赖的旧式单行命令。
+两个平台的服务模块会按运行操作系统选择，但动态加载不会被 PyInstaller 自动可靠发现。
+Windows spec 和 Ubuntu 命令均显式包含两个平台服务模块。Windows 服务所需的 pywin32
+模块仅由 Windows 构建收集；Ubuntu 不需要安装 pywin32。
+如果直接使用 PyInstaller 命令而不使用 spec，必须显式添加隐藏导入；否则打包后的
+Windows 程序创建服务时可能报告找不到 windows_service。
 
 
-Ubuntu / Linux -> FolderSync：
+Ubuntu -> FolderSync：
 
-    pyinstaller --onefile --name "FolderSync" folder_sync.py
+    pyinstaller --onefile --hidden-import=service_manager --hidden-import=windows_service --hidden-import=ubuntu_service --add-data "foldersync.png:." --name "FolderSync" folder_sync.py
 
 输出：dist/FolderSync
 
 注意：打包前确保已安装 pyqt6 相关依赖，且 PyInstaller 版本 >= 5.0
+Ubuntu 依赖不包含 Windows 专用 pywin32。
 
 
 ================================================================================
@@ -110,11 +114,48 @@ Ubuntu / Linux -> FolderSync：
 
 
 ================================================================================
+Ubuntu 定时同步服务
+================================================================================
+
+Windows 和 Ubuntu 使用同一套 FolderSync UI 与同步核心；平台服务实现彼此独立。
+Ubuntu 服务由当前 UI 用户的 systemd user manager 管理，不要求输入或保存 Ubuntu
+用户密码。服务以当前用户身份运行，权限不会高于该用户本身。
+
+创建前须在 GUI 中选择目录 A/B 并成功完成一次同步。设置同步间隔后点击“创建并启动
+服务...”，确认服务名称、目录和日志路径。服务启动后立即同步；之后每轮完成后等待
+指定间隔再开始下一轮。服务创建时若该用户尚未启用 systemd linger，FolderSync 会
+在确认后通过系统授权对话框请求执行 `loginctl enable-linger <当前用户>`。该授权仅
+用于启用此用户的 lingering user manager；服务进程仍以普通当前用户身份运行，不会
+因此取得 root 文件权限。FolderSync 不会收集或保存 Ubuntu 用户密码。
+
+启用 linger 后，用户注销时服务继续运行，系统重启后也会自动启动。删除 FolderSync
+服务不会自动关闭 linger，因为 linger 可能同时被该用户的其他 user service 使用。
+若系统没有可用的图形授权代理，界面会报告原因，并给出由用户自行确认执行的命令；
+程序不会保存 sudo 密码或静默以 root 运行。
+
+Ubuntu 服务配置保存在 `~/.config/FolderSync/services/` 和
+`~/.config/systemd/user/`，服务日志保存在 `~/.local/state/FolderSync/logs/`。
+选中服务后，界面显示 `systemctl --user` 和日志查看命令。服务配置和日志限制为当前
+用户访问。服务列表、启动、删除操作使用同一界面控件，不显示 Windows 密码输入。
+
+SMB 是共享协议，GVFS 是 Ubuntu 桌面可能使用的用户态挂载方式。FolderSync 使用当前
+用户配置和已挂载路径，不在同步时切换或改变挂载方式。用户注销或重启后，GVFS/SMB
+共享可能暂时未挂载；该轮会在日志中明确记录失败，后续周期继续重试。挂载恢复后，
+程序重新比较目录并同步，不会把失败轮次当作已同步。
+
+目录权限按实际扫描和文件操作逐项处理。扫描错误会记入路径和系统错误；单个文件
+复制、读取或删除失败时，会记录具体操作并继续处理其他安全独立的文件，本轮标记为
+部分完成。若任一目录树扫描不完整，本轮跳过所有 DEL 删除规则；也不会把未扫描到的
+文件推断为不存在，从而避免基于不完整目录信息误复制或误删除。后续完整扫描成功后
+会重新比较。
+
+
+================================================================================
 Windows 定时同步服务
 ================================================================================
 
-服务功能仅在 Windows GUI 中提供，不改变 Linux、GUI 手动同步或两个目录参数
-的命令行同步方式。必须先在当前 GUI 窗口选择目录 A/B 并成功完成一次同步，
+Windows 服务仍由 Windows 服务控制管理器（SCM）管理。必须先在当前 GUI 窗口
+选择目录 A/B 并成功完成一次同步，
 之后“创建并启动服务...”按钮才会启用。服务的同步逻辑与 GUI/命令行共用，
 包括 DEL 前缀处理、时间戳比较和路径解析。
 
@@ -122,7 +163,8 @@ Windows 定时同步服务
 
 1. 以管理员身份启动 FolderSync，完成上述一次成功的 GUI 同步。
 2. 设置正整数同步间隔（分钟），点击“创建并启动服务...”。确认对话框会列出
-   最终服务名、两个目录、周期和将使用的 Windows 账户。
+   最终服务名、两个目录、周期、将使用的 Windows 账户和服务日志文件位置；创建
+   成功后也会再次显示日志位置。
 3. 确认账户信息后，在密码框输入该账户密码。密码只传给 SCM 配置服务账户，
    不会保存到配置、命令行或日志。
 4. FolderSync 通过 Windows 服务控制管理器安装真正的 Windows Service 并立即
@@ -130,7 +172,16 @@ Windows 定时同步服务
    等待所设分钟数，然后开始下一轮，因此运行时间会加在两轮开始时间之间。
 5. 界面服务列表只显示通过 FolderSync 标记、服务配置和入口命令共同验证的
    服务。刷新列表后选中服务并点击“删除服务”，确认后程序会先停止运行中的
-   服务，再调用 SCM 删除注册。Windows 可能因服务句柄仍打开而延后完成删除。
+   服务，再调用 SCM 删除注册并清理服务配置。Windows 可能因服务句柄仍打开而
+   延后完成删除；服务日志会保留，方便删除后排查历史运行情况。
+6. 选中已停止的服务后，可点击“更新密码并启动”重新输入该服务当前账户的
+   密码。程序会将新密码交给 SCM 更新凭据并启动服务，不会保存密码；若账户
+   名称或权限本身有误，请在 Windows 服务管理器中检查“登录”设置和服务登录权。
+7. 选中服务后，界面会显示 SCM 实际配置的程序入口（例如
+   `python.exe folder_sync.py --run-service FolderData`）、手动启动命令、
+   服务账户/状态检查命令以及日志查看命令。`--run-service` 是 Windows SCM
+   使用的服务进程入口；通常应点击“更新密码并启动”或运行 `sc.exe start`，
+   不要直接在交互终端手动运行该入口。
 
 服务名称以 `Folder` 加目录 A 的最后一级文件夹名生成。例如
 `E:\Data\Python` 得到 `FolderPython`。Windows 服务名非法字符会替换为下划线；
@@ -150,17 +201,21 @@ Windows 定时同步服务
   当前账户还必须拥有共享权限和目标目录的 NTFS 权限。
 - 服务依赖安装时记录的应用程序绝对路径；服务安装后不要移动或删除
   `FolderSync.exe`。如需更换位置，请先从 GUI 删除服务，再从新位置重新创建。
-- 服务配置存放于 `%ProgramData%\FolderSync\services`；按服务分开的运行日志位于
-  `%ProgramData%\FolderSync\logs\<服务名>.log`。密码不写入这些文件。
+- 服务配置存放于 `%ProgramData%\FolderSync\services\<服务名>`；新建服务的日志位于
+  同目录下的 `service.log`。删除服务会清理配置但保留日志供排错；密码不会写入日志。
+  旧版已安装的服务可能仍使用 `%ProgramData%\FolderSync\logs\<服务名>.log`；
+  服务列表会显示该服务实际使用的日志路径。
 
 排错：
 
-- 服务账户/密码错误：重新创建时确认当前登录账户及密码；账户锁定或密码过期时
-  先按组织策略解除。服务登录失败不会自动切换账户。
+- 服务账户/密码错误：选中已停止服务，点击“更新密码并启动”重新提交当前服务
+  账户的正确密码。账户锁定或密码过期时先按组织策略解除；服务登录失败不会
+  自动切换账户。也可在服务属性的“登录”页检查 SCM 保存的账户。
 - “作为服务登录”错误：请管理员授予该账户相应用户权限后，在 GUI 刷新状态，
   再尝试启动/重建服务。
-- 启动失败：GUI 会报告“已安装但启动失败”，不会误报创建成功，并可选择立即
-  删除该服务；也可在服务列表检查状态后再删除。
+- 启动失败：GUI 会区分 Windows 登录失败（程序尚未运行）和服务程序运行错误。
+  登录失败时服务日志可能尚未生成或没有新内容；可从所选服务显示的
+  `sc.exe qc`、`sc.exe queryex` 命令检查账户和状态。
 - 同步失败或路径不可达：查看上述服务日志中的时间、同步结果和错误；确认目录
   仍存在、服务账户可访问，并针对网络位置检查 UNC、共享权限及 NTFS 权限。
 - SCM 删除可能延迟：关闭仍打开该服务属性或管理句柄的工具后刷新列表；不要把
@@ -256,22 +311,23 @@ DEL_ 前缀字符串当前可在程序中配置，不限于默认的 "DEL_"。
 ================================================================================
 
 folder_sync/
-    folder_sync.py          主程序源码
+    folder_sync.py          主程序与共用同步逻辑
+    service_manager.py      平台服务适配层
+    ubuntu_service.py       Ubuntu systemd 用户服务
     windows_service.py      Windows SCM 服务管理和后台入口
-    foldersync.ico          Windows 图标
-    requirements.txt        Python 依赖
-    README.md               本文件
-    FolderSyncApp.spec      PyInstaller 配置（可选）
-    build/                  构建中间目录（不提交）
-    dist/                   打包输出目录（不提交）
-    .gitignore
+    main_window.ui          共用 UI 源文件
+    ui_main_window.py       Qt Designer 生成的 UI
+    tests/                  自动化测试
+    FolderSync.spec         Windows PyInstaller 配置
+    requirements.txt        Python 依赖（pywin32 仅 Windows）
 
 
 ================================================================================
 开发笔记
 ================================================================================
 
-- 最初在 Ubuntu 上开发，后迁移到 Windows VSCode 重新整理，形成双平台版本
+- 最初在 Ubuntu 上开发，后迁移到 Windows VSCode 调试；同步核心保持共用，
+  Ubuntu systemd 与 Windows SCM 服务采用独立平台实现
 - 使用同一个 GitHub 账号管理两个平台的代码
 - 通过 PyInstaller 分别打包为 .exe 和 Linux binary
 - 通过 GitHub Release 发布各平台版本

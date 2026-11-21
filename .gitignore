@@ -34,3 +34,17 @@ htmlcov/
 # 系统文件
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Windows 临时文件、快捷方式和系统目录
+*.tmp
+*.temp
+~*.tmp
+*.lnk
+pagefile.sys
+hiberfil.sys
+swapfile.sys
+$Recycle.Bin/
+$RECYCLE.BIN/
+System Volume Information/

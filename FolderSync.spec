@@ -1,17 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import sys
 
 a = Analysis(
     ['folder_sync.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=(
-        ['PyQt6.sip', 'servicemanager', 'win32api', 'win32con', 'win32event',
-         'win32security', 'win32service', 'win32serviceutil']
-        if sys.platform == 'win32' else ['PyQt6.sip']
-    ),
+    datas=[('foldersync.ico', '.')],
+    hiddenimports=['PyQt6.sip', 'windows_service'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

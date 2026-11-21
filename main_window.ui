@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>900</width>
-    <height>900</height>
+    <height>1000</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -146,6 +146,16 @@
            </property>
           </widget>
          </item>
+          <item>
+           <widget class="QPushButton" name="btn_start_service">
+            <property name="text">
+             <string>更新密码并启动</string>
+            </property>
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+           </widget>
+          </item>
          <item>
           <spacer name="service_controls_spacer">
            <property name="orientation">
@@ -218,6 +228,40 @@
           </property>
          </column>
         </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_service_command">
+         <property name="text">
+          <string>服务入口与排错命令（选中服务后显示）：</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="service_command_layout">
+         <item>
+          <widget class="QPlainTextEdit" name="service_command_output">
+           <property name="maximumSize">
+            <size>
+             <width>16777215</width>
+             <height>110</height>
+            </size>
+           </property>
+           <property name="readOnly">
+            <bool>true</bool>
+           </property>
+           <property name="placeholderText">
+            <string>选择服务后显示服务进程入口、启动/检查命令和日志位置...</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btn_copy_service_command">
+           <property name="text">
+            <string>复制启动命令</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
        <item>
         <widget class="QLabel" name="label_service_note">

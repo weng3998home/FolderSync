@@ -38,6 +38,9 @@ class ManagedService:
     directory_b: str
     interval_minutes: int
     status: str
+    account: str
+    binary_path: str
+    log_path: str
 
 
 def validate_interval(value: str | int) -> int:
@@ -127,7 +130,19 @@ def _program_data() -> Path:
     return Path(root) / "FolderSync"
 
 
+def service_log_path(service_name: str) -> Path:
+    if not service_name or Path(service_name).name != service_name:
+        raise ServiceManagerError("服务名称无效。")
+    return _program_data() / "services" / service_name / "service.log"
+
+
 def _config_path(service_name: str) -> Path:
+    if not service_name or Path(service_name).name != service_name:
+        raise ServiceManagerError("服务名称无效。")
+    return _program_data() / "services" / service_name / "config.json"
+
+
+def _legacy_config_path(service_name: str) -> Path:
     if not service_name or Path(service_name).name != service_name:
         raise ServiceManagerError("服务名称无效。")
     return _program_data() / "services" / f"{service_name}.json"
@@ -139,7 +154,16 @@ def _load_config(service_name: str) -> dict | None:
         with path.open("r", encoding="utf-8") as config_file:
             config = json.load(config_file)
     except FileNotFoundError:
-        return None
+        path = _legacy_config_path(service_name)
+        try:
+            with path.open("r", encoding="utf-8") as config_file:
+                config = json.load(config_file)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ServiceManagerError(
+                f"无法读取服务配置 {path}：{exc}"
+            ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ServiceManagerError(f"无法读取服务配置 {path}：{exc}") from exc
 
@@ -150,6 +174,55 @@ def _load_config(service_name: str) -> dict | None:
         or config.get("service_name") != service_name
     ):
         return None
+    return config
+
+
+def _validate_service_config(service_name: str, config: dict) -> dict:
+    required_strings = (
+        "directory_a",
+        "directory_b",
+        "sync_path_a",
+        "sync_path_b",
+        "account",
+        "binary_path",
+        "log_path",
+    )
+    if (
+        not isinstance(config, dict)
+        or config.get("marker") != SERVICE_MARKER
+        or type(config.get("version")) is not int
+        or config.get("version") != CONFIG_VERSION
+        or config.get("service_name") != service_name
+    ):
+        raise ServiceManagerError("服务配置无效：标记、版本或服务名称不匹配。")
+
+    for key in required_strings:
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ServiceManagerError(f"服务配置无效：字段“{key}”缺失或格式错误。")
+
+    try:
+        interval = validate_interval(config.get("interval_minutes"))
+    except ValueError as exc:
+        raise ServiceManagerError(
+            "服务配置无效：同步间隔必须是正整数（分钟）。"
+        ) from exc
+    if type(config.get("interval_minutes")) is not int:
+        raise ServiceManagerError("服务配置无效：同步间隔必须是整数。")
+
+    allowed_log_paths = (
+        service_log_path(service_name),
+        _program_data() / "logs" / f"{service_name}.log",
+    )
+    normalized_log_path = os.path.normcase(os.path.abspath(config["log_path"]))
+    if normalized_log_path not in {
+        os.path.normcase(os.path.abspath(path)) for path in allowed_log_paths
+    }:
+        raise ServiceManagerError(
+            "服务配置无效：日志路径与此服务允许的日志位置不匹配。"
+        )
+
+    config["interval_minutes"] = interval
     return config
 
 
@@ -196,11 +269,29 @@ def _service_description(service, win32service) -> str:
 
 
 def _service_binary_path(service, win32service) -> str:
+    return _service_config(service, win32service)[3]
+
+
+def _service_config(service, win32service):
     try:
-        config = win32service.QueryServiceConfig(service)
+        return win32service.QueryServiceConfig(service)
     except Exception as exc:
         raise ServiceManagerError(f"无法读取服务配置：{exc}") from exc
-    return config[3]
+
+
+def _verified_service_config(
+    service_name: str, service, win32service, action: str = "操作"
+) -> dict:
+    config = _load_config(service_name)
+    description = _service_description(service, win32service)
+    binary_path = _service_binary_path(service, win32service)
+    if not is_managed_service(
+        service_name, description, binary_path, config
+    ):
+        raise ServiceManagerError(
+            f"拒绝{action}服务“{service_name}”：无法验证其由 FolderSync 创建和管理。"
+        )
+    return config
 
 
 def _status_text(status: int, win32service) -> str:
@@ -270,7 +361,8 @@ def list_managed_services() -> list[ManagedService]:
                 )
                 config = _load_config(service_name)
                 description = _service_description(service, win32service)
-                binary_path = _service_binary_path(service, win32service)
+                service_config = _service_config(service, win32service)
+                binary_path = service_config[3]
                 if not is_managed_service(
                     service_name, description, binary_path, config
                 ):
@@ -281,6 +373,9 @@ def list_managed_services() -> list[ManagedService]:
                     config["directory_b"],
                     validate_interval(config["interval_minutes"]),
                     _status_text(status[1], win32service),
+                    service_config[7],
+                    binary_path,
+                    config["log_path"],
                 ))
             except ServiceManagerError:
                 raise
@@ -312,23 +407,46 @@ def next_service_name(directory_a: str) -> str:
         win32service.CloseServiceHandle(manager)
 
 
-def _grant_account_access(path: Path, account: str, win32con, win32security):
+def _grant_account_access(
+    path: Path,
+    account: str,
+    win32con,
+    win32security,
+    access_mask: int,
+    inheritance_flags: int,
+):
     try:
         sid, _, _ = win32security.LookupAccountName(None, account)
         descriptor = win32security.GetFileSecurity(
             str(path), win32security.DACL_SECURITY_INFORMATION
         )
         dacl = descriptor.GetSecurityDescriptorDacl()
+        if dacl is None:
+            raise ServiceManagerError(
+                f"无法为服务账户 {account} 配置服务数据文件/目录权限："
+                "对象使用空 DACL，无法安全地追加最小权限。"
+            )
+        for index in range(dacl.GetAceCount()):
+            header, existing_mask, existing_sid = dacl.GetAce(index)
+            if (
+                header[0] == win32con.ACCESS_ALLOWED_ACE_TYPE
+                and existing_sid == sid
+                and existing_mask & access_mask == access_mask
+                and header[1] & inheritance_flags == inheritance_flags
+            ):
+                return
         dacl.AddAccessAllowedAceEx(
             win32security.ACL_REVISION_DS,
-            win32con.CONTAINER_INHERIT_ACE | win32con.OBJECT_INHERIT_ACE,
-            win32con.GENERIC_ALL,
+            inheritance_flags,
+            access_mask,
             sid,
         )
         descriptor.SetSecurityDescriptorDacl(1, dacl, 0)
         win32security.SetFileSecurity(
             str(path), win32security.DACL_SECURITY_INFORMATION, descriptor
         )
+    except ServiceManagerError:
+        raise
     except Exception as exc:
         raise ServiceManagerError(
             f"无法为服务账户 {account} 配置服务数据目录权限：{exc}"
@@ -383,7 +501,12 @@ def _wait_until_running(service, service_name: str, win32service) -> None:
             exit_code = status[3]
             detail = f"Windows 服务状态为已停止（退出码 {exit_code}）。"
             if exit_code == 1069:
-                detail += "请检查账户密码及“作为服务登录”权限。"
+                detail += (
+                    "这是 Windows 服务账户登录失败，程序代码尚未运行；"
+                    "请用“sc.exe qc”确认登录账户，并更新该账户在服务中保存的密码。"
+                    "也请确认账户未锁定/过期且具有“作为服务登录”权限。"
+                    "此时服务日志可能尚未生成或没有新内容。"
+                )
             raise ServiceStartError(
                 service_name, f"服务“{service_name}”已安装，但启动失败：{detail}"
             )
@@ -393,17 +516,118 @@ def _wait_until_running(service, service_name: str, win32service) -> None:
     )
 
 
+def start_managed_service(service_name: str, password: str) -> bool:
+    """更新已安装服务的保存密码并启动；若服务已运行则不做修改。"""
+    require_admin()
+    _, _, _, _, win32service, _ = _win32()
+    manager = _open_scm(win32service, win32service.SC_MANAGER_CONNECT)
+    service = None
+    try:
+        access = (
+            win32service.SERVICE_QUERY_CONFIG
+            | win32service.SERVICE_QUERY_STATUS
+            | win32service.SERVICE_CHANGE_CONFIG
+            | win32service.SERVICE_START
+        )
+        service = win32service.OpenService(manager, service_name, access)
+        _verified_service_config(service_name, service, win32service)
+
+        status = win32service.QueryServiceStatus(service)
+        if status[1] == win32service.SERVICE_RUNNING:
+            return False
+        if status[1] != win32service.SERVICE_STOPPED:
+            _wait_until_running(service, service_name, win32service)
+            return False
+
+        account = _service_config(service, win32service)[7]
+        if not account:
+            raise ServiceManagerError(
+                f"无法读取服务“{service_name}”配置的 Windows 登录账户。"
+            )
+        try:
+            win32service.ChangeServiceConfig(
+                service,
+                win32service.SERVICE_NO_CHANGE,
+                win32service.SERVICE_NO_CHANGE,
+                win32service.SERVICE_NO_CHANGE,
+                None,
+                None,
+                None,
+                None,
+                account,
+                password,
+                None,
+            )
+        except Exception as exc:
+            code, detail = _windows_error(exc, password)
+            raise ServiceManagerError(
+                f"更新服务“{service_name}”账户 {account} 的登录密码失败"
+                f"{f'（错误 {code}）' if code is not None else ''}：{detail}"
+            ) from exc
+
+        try:
+            win32service.StartService(service, None)
+        except Exception as exc:
+            code, detail = _windows_error(exc, password)
+            raise ServiceStartError(
+                service_name,
+                f"服务“{service_name}”已保存新密码，但启动请求失败"
+                f"{f'（错误 {code}）' if code is not None else ''}：{detail}",
+            ) from exc
+        _wait_until_running(service, service_name, win32service)
+        return True
+    except ServiceManagerError:
+        raise
+    except Exception as exc:
+        code, detail = _windows_error(exc, password)
+        raise ServiceManagerError(
+            f"启动服务“{service_name}”失败"
+            f"{f'（错误 {code}）' if code is not None else ''}：{detail}"
+        ) from exc
+    finally:
+        password = ""
+        if service:
+            win32service.CloseServiceHandle(service)
+        win32service.CloseServiceHandle(manager)
+
+
 def _write_config(config: dict, account: str, win32con, win32security) -> None:
-    base = _program_data()
-    service_directory = base / "services" / config["service_name"]
-    logs_directory = base / "logs"
+    service_directory = _config_path(config["service_name"]).parent
     try:
         service_directory.mkdir(parents=True, exist_ok=True)
-        logs_directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ServiceManagerError(f"无法创建服务数据目录：{exc}") from exc
-    _grant_account_access(service_directory, account, win32con, win32security)
-    _grant_account_access(logs_directory, account, win32con, win32security)
+    try:
+        import ntsecuritycon
+    except ImportError as exc:
+        raise ServiceManagerError(
+            "缺少 Windows 服务依赖 pywin32，请重新安装应用或运行依赖安装。"
+        ) from exc
+
+    inheritable_flags = (
+        win32con.CONTAINER_INHERIT_ACE | win32con.OBJECT_INHERIT_ACE
+    )
+    _grant_account_access(
+        service_directory,
+        account,
+        win32con,
+        win32security,
+        ntsecuritycon.FILE_GENERIC_READ,
+        inheritable_flags,
+    )
+    log_path = service_log_path(config["service_name"])
+    try:
+        log_path.touch(exist_ok=True)
+    except OSError as exc:
+        raise ServiceManagerError(f"无法创建服务日志文件：{exc}") from exc
+    _grant_account_access(
+        log_path,
+        account,
+        win32con,
+        win32security,
+        ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_WRITE,
+        0,
+    )
 
     path = _config_path(config["service_name"])
     temporary_path = path.with_suffix(".tmp")
@@ -421,10 +645,19 @@ def _write_config(config: dict, account: str, win32con, win32security) -> None:
 
 
 def _remove_config(service_name: str) -> None:
-    try:
-        _config_path(service_name).unlink(missing_ok=True)
-    except OSError as exc:
-        raise ServiceManagerError(f"服务配置清理失败：{exc}") from exc
+    errors = []
+    config_path = _config_path(service_name)
+    for path in (
+        config_path,
+        config_path.with_suffix(".tmp"),
+        _legacy_config_path(service_name),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            errors.append(f"{path}：{exc}")
+    if errors:
+        raise ServiceManagerError(f"服务配置清理失败：{'；'.join(errors)}")
 
 
 def create_service(
@@ -468,7 +701,7 @@ def create_service(
             "interval_minutes": interval,
             "account": account,
             "binary_path": command,
-            "log_path": str(_program_data() / "logs" / f"{service_name}.log"),
+            "log_path": str(service_log_path(service_name)),
         }
         _write_config(config, account, win32con, win32security)
         try:
@@ -490,7 +723,7 @@ def create_service(
             win32service.ChangeServiceConfig2(
                 service,
                 win32service.SERVICE_CONFIG_DESCRIPTION,
-                {"Description": SERVICE_MARKER},
+                SERVICE_MARKER,
             )
         except Exception as original_error:
             cleanup_errors = []
@@ -539,7 +772,7 @@ def create_service(
 
 def delete_service(service_name: str) -> None:
     require_admin()
-    _, _, _, _, win32service, _ = _win32()
+    _, win32con, _, _, win32service, _ = _win32()
     manager = _open_scm(
         win32service,
         win32service.SC_MANAGER_CONNECT,
@@ -552,17 +785,11 @@ def delete_service(service_name: str) -> None:
             win32service.SERVICE_QUERY_CONFIG
             | win32service.SERVICE_QUERY_STATUS
             | win32service.SERVICE_STOP
-            | win32service.DELETE,
+            | win32con.DELETE,
         )
-        config = _load_config(service_name)
-        description = _service_description(service, win32service)
-        binary_path = _service_binary_path(service, win32service)
-        if not is_managed_service(
-            service_name, description, binary_path, config
-        ):
-            raise ServiceManagerError(
-                f"拒绝删除服务“{service_name}”：无法验证其由 FolderSync 创建和管理。"
-            )
+        _verified_service_config(
+            service_name, service, win32service, action="删除"
+        )
 
         status = win32service.QueryServiceStatus(service)
         if status[1] != win32service.SERVICE_STOPPED:
@@ -591,6 +818,13 @@ def delete_service(service_name: str) -> None:
         except Exception as exc:
             raise ServiceManagerError(
                 f"删除服务“{service_name}”失败：{exc}"
+            ) from exc
+        try:
+            _remove_config(service_name)
+        except ServiceManagerError as exc:
+            raise ServiceManagerError(
+                f"服务“{service_name}”已提交删除，但配置清理失败：{exc}"
+                f"服务日志已保留在 {service_log_path(service_name)}。"
             ) from exc
     except ServiceManagerError:
         raise
@@ -626,10 +860,7 @@ def run_service(
         raise ServiceManagerError(
             f"找不到服务“{service_name}”的有效 FolderSync 配置。"
         )
-    if config.get("interval_minutes") != validate_interval(
-        config.get("interval_minutes")
-    ):
-        raise ServiceManagerError("服务配置中的同步间隔无效。")
+    config = _validate_service_config(service_name, config)
 
     class FolderSyncService(win32serviceutil.ServiceFramework):
         _svc_name_ = service_name
@@ -662,34 +893,31 @@ def run_service(
         def SvcDoRun(self):
             log_path = Path(config["log_path"])
             interval_ms = config["interval_minutes"] * 60 * 1000
+            cycle_number = 0
             while True:
                 wait_result = win32event.WaitForSingleObject(self.stop_event, 0)
                 if wait_result == win32event.WAIT_OBJECT_0:
                     return
                 if wait_result != win32event.WAIT_TIMEOUT:
                     raise ServiceManagerError("无法检查服务停止事件。")
-                cycle_logs = []
+                cycle_number += 1
+                cycle_started = time.monotonic()
                 try:
+                    _append_log(log_path, f"第 {cycle_number} 轮同步开始。")
                     result = sync_once(
                         config["sync_path_a"],
                         config["sync_path_b"],
-                        cycle_logs.append,
+                        lambda message: _append_log(log_path, message),
                     )
-                    if result.startswith("出错:"):
+                    if not result.startswith("完成 —"):
                         raise RuntimeError(result)
-                    for message in cycle_logs:
-                        _append_log(log_path, message)
-                    _append_log(log_path, f"同步成功：{result}")
+                    elapsed = time.monotonic() - cycle_started
+                    _append_log(
+                        log_path,
+                        f"第 {cycle_number} 轮同步成功（耗时 {elapsed:.1f} 秒）：{result}",
+                    )
                 except Exception as exc:
-                    if not isinstance(exc, OSError):
-                        for message in cycle_logs:
-                            try:
-                                _append_log(log_path, message)
-                            except OSError as log_exc:
-                                servicemanager.LogErrorMsg(
-                                    f"FolderSync 服务日志写入失败：{log_exc}"
-                                )
-                    error = f"同步失败：{exc}"
+                    error = f"第 {cycle_number} 轮同步失败：{exc}"
                     try:
                         _append_log(log_path, error)
                     except OSError as log_exc:
